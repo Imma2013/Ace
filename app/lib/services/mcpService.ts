@@ -17,6 +17,7 @@ import {
   TOOL_NO_EXECUTE_FUNCTION,
 } from '~/utils/constants';
 import { createScopedLogger } from '~/utils/logger';
+import { transformMcpToolResult, type McpToolMeta } from './mcp-router';
 
 const logger = createScopedLogger('mcp-service');
 
@@ -83,6 +84,11 @@ export type ToolCall = {
   toolCallId: string;
   toolName: string;
   args: Record<string, unknown>;
+};
+
+export type ToolExecutionBudget = {
+  maxCallsPerTurn: number;
+  callsUsed: number;
 };
 
 export type MCPServerTools = Record<string, MCPServer>;
@@ -374,7 +380,11 @@ export class MCPService {
     }
   }
 
-  async processToolInvocations(messages: Message[], dataStream: DataStreamWriter): Promise<Message[]> {
+  async processToolInvocations(
+    messages: Message[],
+    dataStream: DataStreamWriter,
+    budget?: ToolExecutionBudget,
+  ): Promise<Message[]> {
     const lastMessage = messages[messages.length - 1];
     const parts = lastMessage.parts;
 
@@ -399,6 +409,24 @@ export class MCPService {
 
         let result;
 
+        if (budget && budget.callsUsed >= budget.maxCallsPerTurn) {
+          result = `[HUMAN_REVIEW_REQUIRED] MCP call budget exceeded (${budget.maxCallsPerTurn} per turn).`;
+          dataStream.write(
+            formatDataStreamPart('tool_result', {
+              toolCallId,
+              result,
+            }),
+          );
+
+          return {
+            ...part,
+            toolInvocation: {
+              ...toolInvocation,
+              result,
+            },
+          };
+        }
+
         if (toolInvocation.result === TOOL_EXECUTION_APPROVAL.APPROVE) {
           const toolInstance = this._tools[toolName];
 
@@ -406,10 +434,22 @@ export class MCPService {
             logger.debug(`calling tool "${toolName}" with args: ${JSON.stringify(toolInvocation.args)}`);
 
             try {
-              result = await toolInstance.execute(toolInvocation.args, {
+              const rawResult = await toolInstance.execute(toolInvocation.args, {
                 messages: convertToCoreMessages(messages),
                 toolCallId,
               });
+              if (budget) {
+                budget.callsUsed += 1;
+              }
+              const serverName = this._toolNamesToServerNames.get(toolName);
+              result = transformMcpToolResult(
+                {
+                  toolName,
+                  description: this.toolsWithoutExecute[toolName]?.description,
+                  serverName,
+                } satisfies McpToolMeta,
+                rawResult,
+              );
             } catch (error) {
               logger.error(`error while calling tool "${toolName}":`, error);
               result = TOOL_EXECUTION_ERROR;
@@ -453,5 +493,52 @@ export class MCPService {
 
   get toolsWithoutExecute() {
     return this._toolsWithoutExecute;
+  }
+
+  getToolCatalog(): McpToolMeta[] {
+    return Object.entries(this._toolsWithoutExecute).map(([toolName, tool]) => ({
+      toolName,
+      description: tool.description || 'No description available',
+      serverName: this._toolNamesToServerNames.get(toolName),
+    }));
+  }
+
+  getToolsWithoutExecuteByNames(toolNames: string[]): ToolSet {
+    const selected = new Set(toolNames);
+    const scoped: ToolSet = {};
+
+    for (const [toolName, tool] of Object.entries(this._toolsWithoutExecute)) {
+      if (selected.has(toolName)) {
+        scoped[toolName] = tool;
+      }
+    }
+
+    return scoped;
+  }
+
+  async executeTool(toolName: string, args: Record<string, unknown>, messages: Message[] = []): Promise<unknown> {
+    if (!this.isValidToolName(toolName)) {
+      throw new Error(`Tool "${toolName}" is not registered`);
+    }
+
+    const toolInstance = this._tools[toolName];
+
+    if (!toolInstance || typeof toolInstance.execute !== 'function') {
+      throw new Error(`Tool "${toolName}" has no execute function`);
+    }
+
+    const raw = await toolInstance.execute(args, {
+      messages: convertToCoreMessages(messages),
+      toolCallId: `auto-${Date.now()}`,
+    });
+
+    return transformMcpToolResult(
+      {
+        toolName,
+        description: this.toolsWithoutExecute[toolName]?.description,
+        serverName: this._toolNamesToServerNames.get(toolName),
+      } satisfies McpToolMeta,
+      raw,
+    );
   }
 }

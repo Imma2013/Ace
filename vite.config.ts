@@ -5,6 +5,7 @@ import { nodePolyfills } from 'vite-plugin-node-polyfills';
 import { optimizeCssModules } from 'vite-plugin-optimize-css-modules';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import * as dotenv from 'dotenv';
+import path from 'node:path';
 
 // Load environment variables from multiple files
 dotenv.config({ path: '.env.local' });
@@ -12,6 +13,8 @@ dotenv.config({ path: '.env' });
 dotenv.config();
 
 export default defineConfig((config) => {
+  const isServe = config.command === 'serve';
+
   return {
     define: {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV),
@@ -43,13 +46,14 @@ export default defineConfig((config) => {
           return null;
         },
       },
-      config.mode !== 'test' && remixCloudflareDevProxy(),
+      isServe && config.mode !== 'test' && remixCloudflareDevProxy(),
       remixVitePlugin({
         future: {
           v3_fetcherPersist: true,
           v3_relativeSplatPath: true,
           v3_throwAbortReason: true,
           v3_lazyRouteDiscovery: true,
+          v3_singleFetch: true,
         },
       }),
       UnoCSS(),
@@ -71,6 +75,19 @@ export default defineConfig((config) => {
           api: 'modern-compiler',
         },
       },
+    },
+    resolve: {
+      alias: [
+        // Undici imports `util/types`, but browser util polyfill packages do not provide this subpath.
+        { find: 'util/types', replacement: path.resolve(process.cwd(), 'app/lib/shims/util-types.ts') },
+        { find: 'node:util/types', replacement: path.resolve(process.cwd(), 'app/lib/shims/util-types.ts') },
+        {
+          find: path.resolve(process.cwd(), 'node_modules/util/types'),
+          replacement: path.resolve(process.cwd(), 'app/lib/shims/util-types.ts'),
+        },
+        { find: 'undici', replacement: path.resolve(process.cwd(), 'app/lib/shims/undici.ts') },
+        { find: 'node:undici', replacement: path.resolve(process.cwd(), 'app/lib/shims/undici.ts') },
+      ],
     },
     test: {
       exclude: [

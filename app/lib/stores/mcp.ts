@@ -7,14 +7,52 @@ const isBrowser = typeof window !== 'undefined';
 type MCPSettings = {
   mcpConfig: MCPConfig;
   maxLLMSteps: number;
+  publicDesignMode: boolean;
+  alwaysOnBackgroundWebResearch: boolean;
+  maxToolsPerRole: number;
+  maxMcpCallsPerTurn: number;
 };
 
 const defaultSettings = {
   maxLLMSteps: 5,
+  publicDesignMode: true,
+  alwaysOnBackgroundWebResearch: true,
+  maxToolsPerRole: 6,
+  maxMcpCallsPerTurn: 12,
   mcpConfig: {
-    mcpServers: {},
+    mcpServers: {
+      webflow: {
+        type: 'streamable-http',
+        url: 'https://mcp.webflow.com/mcp',
+      },
+      playwright: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', '@playwright/mcp@latest', '--headless'],
+      },
+    },
   },
 } satisfies MCPSettings;
+
+function ensureDefaultMcpServers(settings: MCPSettings): MCPSettings {
+  const currentServers = settings.mcpConfig?.mcpServers || {};
+  const mergedServers = {
+    ...defaultSettings.mcpConfig.mcpServers,
+    ...currentServers,
+  };
+
+  return {
+    ...settings,
+    publicDesignMode: settings.publicDesignMode ?? defaultSettings.publicDesignMode,
+    alwaysOnBackgroundWebResearch:
+      settings.alwaysOnBackgroundWebResearch ?? defaultSettings.alwaysOnBackgroundWebResearch,
+    maxToolsPerRole: settings.maxToolsPerRole ?? defaultSettings.maxToolsPerRole,
+    maxMcpCallsPerTurn: settings.maxMcpCallsPerTurn ?? defaultSettings.maxMcpCallsPerTurn,
+    mcpConfig: {
+      mcpServers: mergedServers,
+    },
+  };
+}
 
 type Store = {
   isInitialized: boolean;
@@ -46,8 +84,14 @@ export const useMCPStore = create<Store & Actions>((set, get) => ({
 
       if (savedConfig) {
         try {
-          const settings = JSON.parse(savedConfig) as MCPSettings;
+          const rawSettings = JSON.parse(savedConfig) as MCPSettings;
+          const settings = ensureDefaultMcpServers(rawSettings);
           const serverTools = await updateServerConfig(settings.mcpConfig);
+
+          if (isBrowser) {
+            localStorage.setItem(MCP_SETTINGS_KEY, JSON.stringify(settings));
+          }
+
           set(() => ({ settings, serverTools }));
         } catch (error) {
           console.error('Error parsing saved mcp config:', error);
@@ -56,7 +100,7 @@ export const useMCPStore = create<Store & Actions>((set, get) => ({
           }));
         }
       } else {
-        localStorage.setItem(MCP_SETTINGS_KEY, JSON.stringify(defaultSettings));
+        localStorage.setItem(MCP_SETTINGS_KEY, JSON.stringify(ensureDefaultMcpServers(defaultSettings)));
       }
     }
 

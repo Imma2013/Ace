@@ -4,24 +4,18 @@ import type { MCPConfig } from '~/lib/services/mcpService';
 import { toast } from 'react-toastify';
 import { useMCPStore } from '~/lib/stores/mcp';
 import McpServerList from '~/components/@settings/tabs/mcp/McpServerList';
+import { Switch } from '~/components/ui/Switch';
 
 const EXAMPLE_MCP_CONFIG: MCPConfig = {
   mcpServers: {
-    everything: {
+    webflow: {
+      type: 'streamable-http',
+      url: 'https://mcp.webflow.com/mcp',
+    },
+    playwright: {
       type: 'stdio',
       command: 'npx',
-      args: ['-y', '@modelcontextprotocol/server-everything'],
-    },
-    deepwiki: {
-      type: 'streamable-http',
-      url: 'https://mcp.deepwiki.com/mcp',
-    },
-    'local-sse': {
-      type: 'sse',
-      url: 'http://localhost:8000/sse',
-      headers: {
-        Authorization: 'Bearer mytoken123',
-      },
+      args: ['-y', '@playwright/mcp@latest', '--headless'],
     },
   },
 };
@@ -37,6 +31,10 @@ export default function McpTab() {
   const [isSaving, setIsSaving] = useState(false);
   const [mcpConfigText, setMCPConfigText] = useState('');
   const [maxLLMSteps, setMaxLLMSteps] = useState(1);
+  const [publicDesignMode, setPublicDesignMode] = useState(true);
+  const [alwaysOnBackgroundWebResearch, setAlwaysOnBackgroundWebResearch] = useState(true);
+  const [maxToolsPerRole, setMaxToolsPerRole] = useState(6);
+  const [maxMcpCallsPerTurn, setMaxMcpCallsPerTurn] = useState(12);
   const [error, setError] = useState<string | null>(null);
   const [isCheckingServers, setIsCheckingServers] = useState(false);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
@@ -53,6 +51,10 @@ export default function McpTab() {
   useEffect(() => {
     setMCPConfigText(JSON.stringify(settings.mcpConfig, null, 2));
     setMaxLLMSteps(settings.maxLLMSteps);
+    setPublicDesignMode(settings.publicDesignMode);
+    setAlwaysOnBackgroundWebResearch(settings.alwaysOnBackgroundWebResearch);
+    setMaxToolsPerRole(settings.maxToolsPerRole);
+    setMaxMcpCallsPerTurn(settings.maxMcpCallsPerTurn);
     setError(null);
   }, [settings]);
 
@@ -81,6 +83,10 @@ export default function McpTab() {
       await updateSettings({
         mcpConfig: parsedConfig,
         maxLLMSteps,
+        publicDesignMode,
+        alwaysOnBackgroundWebResearch,
+        maxToolsPerRole,
+        maxMcpCallsPerTurn,
       });
       toast.success('MCP configuration saved');
 
@@ -192,6 +198,57 @@ export default function McpTab() {
               className="w-full px-3 py-2 text-bolt-elements-textPrimary text-sm rounded-lg bg-white dark:bg-bolt-elements-background-depth-4 border border-bolt-elements-borderColor dark:border-bolt-elements-borderColor-dark focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>
+          <div className="rounded-lg border border-bolt-elements-borderColor p-3 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm text-bolt-elements-textPrimary">Public Design Mode</div>
+                <div className="text-xs text-bolt-elements-textSecondary">
+                  Disable OAuth-dependent Webflow calls and use public design sources.
+                </div>
+              </div>
+              <Switch checked={publicDesignMode} onCheckedChange={setPublicDesignMode} />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm text-bolt-elements-textPrimary">Always-On Background Web Research</div>
+                <div className="text-xs text-bolt-elements-textSecondary">
+                  Run Playwright-based background research automatically in build mode.
+                </div>
+              </div>
+              <Switch checked={alwaysOnBackgroundWebResearch} onCheckedChange={setAlwaysOnBackgroundWebResearch} />
+            </div>
+
+            <div>
+              <label htmlFor="max-tools-role" className="block text-sm text-bolt-elements-textSecondary mb-2">
+                Max MCP tools per role
+              </label>
+              <input
+                id="max-tools-role"
+                type="number"
+                min="1"
+                max="12"
+                value={maxToolsPerRole}
+                onChange={(e) => setMaxToolsPerRole(parseInt(e.target.value || '1', 10))}
+                className="w-full px-3 py-2 text-bolt-elements-textPrimary text-sm rounded-lg bg-white dark:bg-bolt-elements-background-depth-4 border border-bolt-elements-borderColor dark:border-bolt-elements-borderColor-dark focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="max-calls-turn" className="block text-sm text-bolt-elements-textSecondary mb-2">
+                Max MCP calls per turn
+              </label>
+              <input
+                id="max-calls-turn"
+                type="number"
+                min="1"
+                max="40"
+                value={maxMcpCallsPerTurn}
+                onChange={(e) => setMaxMcpCallsPerTurn(parseInt(e.target.value || '1', 10))}
+                className="w-full px-3 py-2 text-bolt-elements-textPrimary text-sm rounded-lg bg-white dark:bg-bolt-elements-background-depth-4 border border-bolt-elements-borderColor dark:border-bolt-elements-borderColor-dark focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+          </div>
           <div className="mt-2 text-sm text-bolt-elements-textSecondary">
             The MCP configuration format is identical to the one used in Claude Desktop.
             <a
@@ -203,6 +260,10 @@ export default function McpTab() {
               View example servers
               <div className="i-ph:arrow-square-out w-4 h-4" />
             </a>
+          </div>
+          <div className="mt-1 text-xs text-bolt-elements-textSecondary">
+            Webflow MCP requires account auth/permissions in Webflow. Playwright MCP runs headless browser automation via
+            MCP STDIO.
           </div>
         </div>
       </section>

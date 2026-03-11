@@ -1,4 +1,4 @@
-import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { type ActionFunctionArgs } from '@remix-run/node';
 import { createDataStream, generateId } from 'ai';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS, type FileMap } from '~/lib/.server/llm/constants';
 import { CONTINUE_PROMPT } from '~/lib/common/prompts/prompts';
@@ -14,6 +14,7 @@ import { extractPropertiesFromMessage } from '~/lib/.server/llm/utils';
 import type { DesignScheme } from '~/types/design-scheme';
 import { MCPService } from '~/lib/services/mcpService';
 import { StreamRecoveryManager } from '~/lib/.server/llm/stream-recovery';
+import { buildAstroOrchestrationContext } from '~/lib/.server/llm/astro-orchestrator';
 
 export async function action(args: ActionFunctionArgs) {
   return chatAction(args);
@@ -39,6 +40,134 @@ function parseCookies(cookieHeader: string): Record<string, string> {
   return cookies;
 }
 
+function getLastUserMessageText(messages: any[]): string {
+  const lastUser = [...messages].reverse().find((message) => message.role === 'user');
+
+  if (!lastUser) {
+    return '';
+  }
+
+  const content: any = lastUser.content;
+
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .filter((part: any) => part?.type === 'text')
+      .map((part: any) => part?.text || '')
+      .join('\n');
+  }
+
+  return '';
+}
+
+function extractFirstUrl(text: string): string | null {
+  const match = text.match(/https?:\/\/[^\s)]+/i);
+  return match ? match[0] : null;
+}
+
+const DESIGN_REFERENCE_URLS = ['https://webflow.com/made-in-webflow', 'https://21st.dev/magic'];
+const CODE_SUPPORT_DOC_URLS = {
+  core: ['https://nextjs.org/docs', 'https://supabase.com/docs'],
+  stripe: 'https://docs.stripe.com',
+  vercel: 'https://vercel.com/docs',
+};
+const ALLOWED_RESEARCH_HOSTS = ['webflow.com', '21st.dev', 'nextjs.org', 'supabase.com', 'docs.stripe.com', 'vercel.com'];
+
+function getCodeSupportDocUrls(text: string): string[] {
+  const urls = [...CODE_SUPPORT_DOC_URLS.core];
+  const q = text.toLowerCase();
+
+  if (/(stripe|payment|checkout|webhook|billing)/i.test(q)) {
+    urls.push(CODE_SUPPORT_DOC_URLS.stripe);
+  }
+
+  if (/(vercel|deploy|deployment|hosting|edge)/i.test(q)) {
+    urls.push(CODE_SUPPORT_DOC_URLS.vercel);
+  }
+
+  return urls;
+}
+
+function isAllowedResearchUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return ALLOWED_RESEARCH_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+  } catch {
+    return false;
+  }
+}
+
+function buildPlaywrightNavigateArgs(url: string): Record<string, unknown> {
+  return { url };
+}
+
+async function runBackgroundWebResearch(args: {
+  mcpService: MCPService;
+  messages: any[];
+  maxCalls: number;
+}): Promise<string | undefined> {
+  const { mcpService, messages, maxCalls } = args;
+  const callBudget = Math.max(1, Math.min(8, maxCalls));
+  let callsUsed = 0;
+  const catalog = mcpService.getToolCatalog();
+  const playwrightTools = catalog.filter((tool) => (tool.serverName || '').toLowerCase().includes('playwright'));
+
+  if (playwrightTools.length === 0) {
+    return undefined;
+  }
+
+  const text = getLastUserMessageText(messages);
+  const url = extractFirstUrl(text);
+  const shouldIncludeDesignRefs = true;
+  const allowedUserUrl = url && isAllowedResearchUrl(url) ? url : null;
+  const targetUrls = Array.from(
+    new Set([
+      ...(shouldIncludeDesignRefs ? DESIGN_REFERENCE_URLS : []),
+      ...getCodeSupportDocUrls(text),
+      ...(allowedUserUrl ? [allowedUserUrl] : []),
+    ]),
+  );
+  const navigateTool = playwrightTools.find((tool) => /(goto|navigate|open)/i.test(tool.toolName));
+  const snapshotTool = playwrightTools.find((tool) =>
+    /(snapshot|extract|markdown|text|content|eval|get_page_content|get_text|read)/i.test(tool.toolName),
+  );
+  const results: string[] = [];
+
+  try {
+    if (navigateTool && targetUrls.length > 0) {
+      for (const targetUrl of targetUrls) {
+        if (callsUsed >= callBudget) {
+          break;
+        }
+        const navigateResult = await mcpService.executeTool(
+          navigateTool.toolName,
+          buildPlaywrightNavigateArgs(targetUrl),
+          messages,
+        );
+        callsUsed += 1;
+        results.push(`Navigate(${targetUrl}) via ${navigateTool.toolName}: ${JSON.stringify(navigateResult).slice(0, 2200)}`);
+      }
+    }
+
+    if (snapshotTool && callsUsed < callBudget) {
+      const snapshotResult = await mcpService.executeTool(snapshotTool.toolName, {}, messages);
+      callsUsed += 1;
+      results.push(`Snapshot(${snapshotTool.toolName}): ${JSON.stringify(snapshotResult).slice(0, 3600)}`);
+    }
+  } catch (error) {
+    results.push(`Background research warning: ${String(error)}`);
+  }
+
+  if (results.length === 0) {
+    return undefined;
+  }
+
+  return `[AUTO_WEB_RESEARCH]\n${results.join('\n\n')}\n[/AUTO_WEB_RESEARCH]`;
+}
+
 async function chatAction({ context, request }: ActionFunctionArgs) {
   const streamRecovery = new StreamRecoveryManager({
     timeout: 45000,
@@ -48,7 +177,20 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
     },
   });
 
-  const { messages, files, promptId, contextOptimization, supabase, chatMode, designScheme, maxLLMSteps } =
+  const {
+    messages,
+    files,
+    promptId,
+    contextOptimization,
+    supabase,
+    chatMode,
+    designScheme,
+    maxLLMSteps,
+    publicDesignMode,
+    alwaysOnBackgroundWebResearch,
+    maxToolsPerRole,
+    maxMcpCallsPerTurn,
+  } =
     await request.json<{
       messages: Messages;
       files: any;
@@ -56,6 +198,10 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
       contextOptimization: boolean;
       chatMode: 'discuss' | 'build';
       designScheme?: DesignScheme;
+      publicDesignMode?: boolean;
+      alwaysOnBackgroundWebResearch?: boolean;
+      maxToolsPerRole?: number;
+      maxMcpCallsPerTurn?: number;
       supabase?: {
         isConnected: boolean;
         hasSelectedProject: boolean;
@@ -98,8 +244,14 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         let filteredFiles: FileMap | undefined = undefined;
         let summary: string | undefined = undefined;
         let messageSliceId = 0;
+        let scopedTools = mcpService.toolsWithoutExecute;
 
-        const processedMessages = await mcpService.processToolInvocations(messages, dataStream);
+        const toolBudget = {
+          maxCallsPerTurn: Math.max(1, Math.min(40, maxMcpCallsPerTurn || 12)),
+          callsUsed: 0,
+        };
+
+        let processedMessages = await mcpService.processToolInvocations(messages, dataStream, toolBudget);
 
         if (processedMessages.length > 3) {
           messageSliceId = processedMessages.length - 3;
@@ -207,10 +359,80 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           // logger.debug('Code Files Selected');
         }
 
+        const shouldRunBackgroundResearch = alwaysOnBackgroundWebResearch !== false;
+        if (shouldRunBackgroundResearch) {
+          const researchContext = await runBackgroundWebResearch({
+            mcpService,
+            messages: processedMessages,
+            maxCalls: Math.max(1, Math.min(6, toolBudget.maxCallsPerTurn - toolBudget.callsUsed)),
+          });
+
+          if (researchContext) {
+            processedMessages = [
+              ...processedMessages,
+              {
+                id: generateId(),
+                role: 'assistant',
+                content: researchContext,
+              },
+            ];
+          }
+        }
+
+        if (chatMode === 'build') {
+          try {
+            dataStream.writeData({
+              type: 'progress',
+              label: 'planner',
+              status: 'in-progress',
+              order: progressCounter++,
+              message: 'Running Astro Router + Specialists',
+            } satisfies ProgressAnnotation);
+
+            const orchestration = await buildAstroOrchestrationContext({
+              messages: processedMessages,
+              contextFiles: filteredFiles,
+              mcpTools: mcpService.getToolCatalog(),
+              publicDesignMode,
+              maxToolsPerRole,
+              apiKeys,
+              providerSettings,
+              env: context.cloudflare?.env,
+            });
+
+            const orchestrationContext = orchestration.context;
+
+            if (orchestration.allowedToolNames.length > 0) {
+              scopedTools = mcpService.getToolsWithoutExecuteByNames(orchestration.allowedToolNames);
+            }
+
+            if (orchestrationContext) {
+              processedMessages = [
+                ...processedMessages,
+                {
+                  id: generateId(),
+                  role: 'assistant',
+                  content: orchestrationContext,
+                },
+              ];
+            }
+
+            dataStream.writeData({
+              type: 'progress',
+              label: 'planner',
+              status: 'complete',
+              order: progressCounter++,
+              message: 'Orchestration Context Ready',
+            } satisfies ProgressAnnotation);
+          } catch (error) {
+            logger.warn(`Astro orchestration failed; continuing without orchestration context: ${error}`);
+          }
+        }
+
         const options: StreamingOptions = {
           supabaseConnection: supabase,
           toolChoice: 'auto',
-          tools: mcpService.toolsWithoutExecute,
+          tools: scopedTools,
           maxSteps: maxLLMSteps,
           onStepFinish: ({ toolCalls }) => {
             // add tool call annotations for frontend processing

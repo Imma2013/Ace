@@ -4,6 +4,7 @@ import type { KeyboardEvent } from 'react';
 import type { ModelInfo } from '~/lib/modules/llm/types';
 import { classNames } from '~/utils/classNames';
 import { LOCAL_PROVIDERS } from '~/lib/stores/settings';
+import { filterModelsForAstroAgents, getAstroDisplayLabelForModel } from '~/lib/modules/llm/astro-agents';
 
 // Fuzzy search utilities
 const levenshteinDistance = (str1: string, str2: string): number => {
@@ -193,7 +194,8 @@ export const ModelSelector = ({
   }, []);
 
   const filteredModels = useMemo(() => {
-    const baseModels = [...modelList].filter((e) => e.provider === provider?.name && e.name);
+    const providerModels = [...modelList].filter((e) => e.provider === provider?.name && e.name);
+    const baseModels = filterModelsForAstroAgents(providerModels, provider?.name);
 
     return baseModels
       .filter((model) => {
@@ -205,8 +207,10 @@ export const ModelSelector = ({
         return true;
       })
       .map((model) => {
+        const displayLabel = getAstroDisplayLabelForModel(model.name) || model.label;
+
         // Calculate search scores for fuzzy matching
-        const labelMatch = fuzzyMatch(debouncedModelSearchQuery, model.label);
+        const labelMatch = fuzzyMatch(debouncedModelSearchQuery, displayLabel);
         const nameMatch = fuzzyMatch(debouncedModelSearchQuery, model.name);
         const contextMatch = fuzzyMatch(debouncedModelSearchQuery, formatContextSize(model.maxTokenAllowed));
 
@@ -217,7 +221,7 @@ export const ModelSelector = ({
           ...model,
           searchScore: bestScore,
           searchMatches: matches,
-          highlightedLabel: highlightText(model.label, debouncedModelSearchQuery),
+          highlightedLabel: highlightText(displayLabel, debouncedModelSearchQuery),
           highlightedName: highlightText(model.name, debouncedModelSearchQuery),
         };
       })
@@ -658,7 +662,16 @@ export const ModelSelector = ({
           tabIndex={0}
         >
           <div className="flex items-center justify-between">
-            <div className="truncate">{modelList.find((m) => m.name === model)?.label || 'Select model'}</div>
+            <div className="truncate">
+              {(() => {
+                const selectedModel = modelList.find((m) => m.name === model);
+                if (!selectedModel) {
+                  return 'Select model';
+                }
+
+                return getAstroDisplayLabelForModel(selectedModel.name) || selectedModel.label;
+              })()}
+            </div>
             <div
               className={classNames(
                 'i-ph:caret-down w-4 h-4 text-bolt-elements-textSecondary opacity-75',
