@@ -16,6 +16,7 @@
     "dev": "node pre-start.cjs  && remix vite:dev",
     "test": "vitest --run",
     "smoke:playwright-mcp": "node scripts/playwright-mcp-smoke.mjs",
+    "smoke:playwright-e2e": "node scripts/playwright-e2e-smoke.mjs",
     "test:watch": "vitest",
     "lint": "eslint --cache --cache-location ./node_modules/.cache/eslint app",
     "lint:fix": "npm run lint -- --fix && prettier app --write",
