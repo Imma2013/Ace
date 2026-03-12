@@ -4,6 +4,25 @@ import { MCPService, type MCPConfig } from '~/lib/services/mcpService';
 
 const logger = createScopedLogger('api.mcp-update-config');
 
+function parseCookies(cookieHeader: string): Record<string, string> {
+  const cookies: Record<string, string> = {};
+
+  for (const item of cookieHeader.split(';')) {
+    const [name, ...rest] = item.trim().split('=');
+
+    if (name && rest.length > 0) {
+      cookies[decodeURIComponent(name)] = decodeURIComponent(rest.join('='));
+    }
+  }
+
+  return cookies;
+}
+
+function resolveTenantId(request: Request): string {
+  const cookies = parseCookies(request.headers.get('Cookie') || '');
+  return String(request.headers.get('x-tenant-id') || cookies.tenantId || cookies.userId || cookies.sessionId || 'public');
+}
+
 export async function action({ request }: ActionFunctionArgs) {
   try {
     const mcpConfig = (await request.json()) as MCPConfig;
@@ -13,7 +32,8 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     const mcpService = MCPService.getInstance();
-    const serverTools = await mcpService.updateConfig(mcpConfig);
+    const tenantId = resolveTenantId(request);
+    const serverTools = await mcpService.updateConfig(mcpConfig, tenantId);
 
     return Response.json(serverTools);
   } catch (error) {

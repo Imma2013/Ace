@@ -52,3 +52,11 @@
 - Task: Added phase-1 production guardrails in chat runtime: tenant/plan-aware clamps for max LLM steps, MCP calls, and tools-per-role; enforced message-count ceiling; added run-scoped MCP execution and budget-exceeded audit logs.
 - Validation: `npm run typecheck` passed; `npm run build` had previously passed on this branch after migration.
 - Next: wire tenant-scoped MCP config persistence and expose run audit entries in UI/admin panel.
+
+## Update 2026-03-12 (Tenant MCP Isolation)
+- Implemented tenant-isolated MCP runtime state in `MCPService`.
+- Each tenant now has its own MCP config, clients, tool catalog, and tool-name->server map.
+- `api.mcp-update-config` and `api.mcp-check` now resolve tenant identity and operate on tenant scope.
+- `api.chat` now uses tenant-scoped tool catalog/execution and tool invocation processing.
+- Validation: `npm run typecheck` and `npm run build` passed.
+- Commit target: push tenant-scoped MCP isolation to `Ace/main`.

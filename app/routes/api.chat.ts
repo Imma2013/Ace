@@ -203,7 +203,7 @@ async function runBackgroundWebResearch(args: {
   const { mcpService, messages, maxCalls, runId, tenantId } = args;
   const callBudget = Math.max(1, Math.min(8, maxCalls));
   let callsUsed = 0;
-  const catalog = mcpService.getToolCatalog();
+  const catalog = mcpService.getToolCatalog(tenantId);
   const playwrightTools = catalog.filter((tool) => (tool.serverName || '').toLowerCase().includes('playwright'));
 
   if (playwrightTools.length === 0) {
@@ -237,6 +237,7 @@ async function runBackgroundWebResearch(args: {
           navigateTool.toolName,
           buildPlaywrightNavigateArgs(targetUrl),
           messages,
+          tenantId,
         );
         callsUsed += 1;
         logger.info(`[run:${runId}] [tenant:${tenantId}] MCP tool executed`, {
@@ -250,7 +251,7 @@ async function runBackgroundWebResearch(args: {
     }
 
     if (snapshotTool && callsUsed < callBudget) {
-      const snapshotResult = await mcpService.executeTool(snapshotTool.toolName, {}, messages);
+      const snapshotResult = await mcpService.executeTool(snapshotTool.toolName, {}, messages, tenantId);
       callsUsed += 1;
       logger.info(`[run:${runId}] [tenant:${tenantId}] MCP tool executed`, {
         tool: snapshotTool.toolName,
@@ -381,7 +382,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         let filteredFiles: FileMap | undefined = undefined;
         let summary: string | undefined = undefined;
         let messageSliceId = 0;
-        let scopedTools = mcpService.toolsWithoutExecute;
+        let scopedTools = mcpService.getToolsWithoutExecute(limits.tenantId);
 
         const toolBudget = {
           maxCallsPerTurn: limits.maxMcpCallsPerTurn,
@@ -390,7 +391,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           runId,
         };
 
-        let processedMessages = await mcpService.processToolInvocations(messages, dataStream, toolBudget);
+        let processedMessages = await mcpService.processToolInvocations(messages, dataStream, toolBudget, limits.tenantId);
 
         if (processedMessages.length > 3) {
           messageSliceId = processedMessages.length - 3;
@@ -536,7 +537,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
             const orchestration = await buildAstroOrchestrationContext({
               messages: processedMessages,
               contextFiles: filteredFiles,
-              mcpTools: mcpService.getToolCatalog(),
+              mcpTools: mcpService.getToolCatalog(limits.tenantId),
               publicDesignMode,
               maxToolsPerRole: limits.maxToolsPerRole,
               apiKeys,
@@ -547,7 +548,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
             const orchestrationContext = orchestration.context;
 
             if (orchestration.allowedToolNames.length > 0) {
-              scopedTools = mcpService.getToolsWithoutExecuteByNames(orchestration.allowedToolNames);
+              scopedTools = mcpService.getToolsWithoutExecuteByNames(orchestration.allowedToolNames, limits.tenantId);
             }
 
             if (orchestrationContext) {
@@ -581,7 +582,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           onStepFinish: ({ toolCalls }) => {
             // add tool call annotations for frontend processing
             toolCalls.forEach((toolCall) => {
-              mcpService.processToolCall(toolCall, dataStream);
+              mcpService.processToolCall(toolCall, dataStream, limits.tenantId);
             });
           },
           onFinish: async ({ text: content, finishReason, usage }) => {

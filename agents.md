@@ -22,3 +22,8 @@
 - Added runtime governance layer in `api.chat` with tenant + plan limit enforcement and run-id based logging.
 - MCP service now logs per-tool execution and budget-overrun with run/tenant metadata.
 - Remaining hardening target: tenant-isolated MCP server config map (currently shared singleton config).
+
+## Update 2026-03-12 (Tenant MCP Isolation)
+- MCP service now isolates state by tenant (`tenantId`) instead of global singleton state.
+- MCP route handlers map requests to tenant scope via header/cookie resolution.
+- Router/orchestrator flow remains active and now consumes tenant-scoped MCP tools.

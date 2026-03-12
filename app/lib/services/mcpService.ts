@@ -109,15 +109,17 @@ export type MCPServerUnavailable = {
 };
 export type MCPServer = MCPServerAvailable | MCPServerUnavailable;
 
+type TenantMcpState = {
+  tools: ToolSet;
+  toolsWithoutExecute: ToolSet;
+  mcpToolsPerServer: MCPServerTools;
+  toolNamesToServerNames: Map<string, string>;
+  config: MCPConfig;
+};
+
 export class MCPService {
   private static _instance: MCPService;
-  private _tools: ToolSet = {};
-  private _toolsWithoutExecute: ToolSet = {};
-  private _mcpToolsPerServer: MCPServerTools = {};
-  private _toolNamesToServerNames = new Map<string, string>();
-  private _config: MCPConfig = {
-    mcpServers: {},
-  };
+  private _tenantStates = new Map<string, TenantMcpState>();
 
   static getInstance(): MCPService {
     if (!MCPService._instance) {
@@ -125,6 +127,35 @@ export class MCPService {
     }
 
     return MCPService._instance;
+  }
+
+  private _normalizeTenantId(tenantId?: string): string {
+    const id = String(tenantId || 'public').trim();
+    return id.length > 0 ? id : 'public';
+  }
+
+  private _createEmptyTenantState(): TenantMcpState {
+    return {
+      tools: {},
+      toolsWithoutExecute: {},
+      mcpToolsPerServer: {},
+      toolNamesToServerNames: new Map<string, string>(),
+      config: {
+        mcpServers: {},
+      },
+    };
+  }
+
+  private _getTenantState(tenantId?: string): TenantMcpState {
+    const scope = this._normalizeTenantId(tenantId);
+    let state = this._tenantStates.get(scope);
+
+    if (!state) {
+      state = this._createEmptyTenantState();
+      this._tenantStates.set(scope, state);
+    }
+
+    return state;
   }
 
   private _validateServerConfig(serverName: string, config: any): MCPServerConfig {
@@ -168,12 +199,14 @@ export class MCPService {
     }
   }
 
-  async updateConfig(config: MCPConfig) {
-    logger.debug('updating config', JSON.stringify(config));
-    this._config = config;
-    await this._createClients();
+  async updateConfig(config: MCPConfig, tenantId?: string) {
+    const scope = this._normalizeTenantId(tenantId);
+    const state = this._getTenantState(scope);
+    logger.debug(`[tenant:${scope}] updating config`, JSON.stringify(config));
+    state.config = config;
+    await this._createClients(scope);
 
-    return this._mcpToolsPerServer;
+    return state.mcpToolsPerServer;
   }
 
   private async _createStreamableHTTPClient(
@@ -213,19 +246,19 @@ export class MCPService {
     return Object.assign(client, { serverName });
   }
 
-  private _registerTools(serverName: string, tools: ToolSet) {
+  private _registerTools(state: TenantMcpState, serverName: string, tools: ToolSet) {
     for (const [toolName, tool] of Object.entries(tools)) {
-      if (this._tools[toolName]) {
-        const existingServerName = this._toolNamesToServerNames.get(toolName);
+      if (state.tools[toolName]) {
+        const existingServerName = state.toolNamesToServerNames.get(toolName);
 
         if (existingServerName && existingServerName !== serverName) {
           logger.warn(`Tool conflict: "${toolName}" from "${serverName}" overrides tool from "${existingServerName}"`);
         }
       }
 
-      this._tools[toolName] = tool;
-      this._toolsWithoutExecute[toolName] = { ...tool, execute: undefined };
-      this._toolNamesToServerNames.set(toolName, serverName);
+      state.tools[toolName] = tool;
+      state.toolsWithoutExecute[toolName] = { ...tool, execute: undefined };
+      state.toolNamesToServerNames.set(toolName, serverName);
     }
   }
 
@@ -241,10 +274,12 @@ export class MCPService {
     }
   }
 
-  private async _createClients() {
-    await this._closeClients();
+  private async _createClients(tenantId?: string) {
+    const scope = this._normalizeTenantId(tenantId);
+    const state = this._getTenantState(scope);
+    await this._closeClients(scope);
 
-    const createClientPromises = Object.entries(this._config?.mcpServers || []).map(async ([serverName, config]) => {
+    const createClientPromises = Object.entries(state.config?.mcpServers || []).map(async ([serverName, config]) => {
       let client: MCPClient | null = null;
 
       try {
@@ -253,9 +288,9 @@ export class MCPService {
         try {
           const tools = await client.tools();
 
-          this._registerTools(serverName, tools);
+          this._registerTools(state, serverName, tools);
 
-          this._mcpToolsPerServer[serverName] = {
+          state.mcpToolsPerServer[serverName] = {
             status: 'available',
             client,
             tools,
@@ -263,7 +298,7 @@ export class MCPService {
           };
         } catch (error) {
           logger.error(`Failed to get tools from server ${serverName}:`, error);
-          this._mcpToolsPerServer[serverName] = {
+          state.mcpToolsPerServer[serverName] = {
             status: 'unavailable',
             error: 'could not retrieve tools from server',
             client,
@@ -272,7 +307,7 @@ export class MCPService {
         }
       } catch (error) {
         logger.error(`Failed to initialize MCP client for server: ${serverName}`, error);
-        this._mcpToolsPerServer[serverName] = {
+        state.mcpToolsPerServer[serverName] = {
           status: 'unavailable',
           error: (error as Error).message,
           client,
@@ -284,27 +319,29 @@ export class MCPService {
     await Promise.allSettled(createClientPromises);
   }
 
-  async checkServersAvailabilities() {
-    this._tools = {};
-    this._toolsWithoutExecute = {};
-    this._toolNamesToServerNames.clear();
+  async checkServersAvailabilities(tenantId?: string) {
+    const scope = this._normalizeTenantId(tenantId);
+    const state = this._getTenantState(scope);
+    state.tools = {};
+    state.toolsWithoutExecute = {};
+    state.toolNamesToServerNames.clear();
 
-    const checkPromises = Object.entries(this._mcpToolsPerServer).map(async ([serverName, server]) => {
+    const checkPromises = Object.entries(state.mcpToolsPerServer).map(async ([serverName, server]) => {
       let client = server.client;
 
       try {
-        logger.debug(`Checking MCP server "${serverName}" availability: start`);
+        logger.debug(`[tenant:${scope}] Checking MCP server "${serverName}" availability: start`);
 
         if (!client) {
-          client = await this._createMCPClient(serverName, this._config?.mcpServers[serverName]);
+          client = await this._createMCPClient(serverName, state.config?.mcpServers[serverName]);
         }
 
         try {
           const tools = await client.tools();
 
-          this._registerTools(serverName, tools);
+          this._registerTools(state, serverName, tools);
 
-          this._mcpToolsPerServer[serverName] = {
+          state.mcpToolsPerServer[serverName] = {
             status: 'available',
             client,
             tools,
@@ -312,7 +349,7 @@ export class MCPService {
           };
         } catch (error) {
           logger.error(`Failed to get tools from server ${serverName}:`, error);
-          this._mcpToolsPerServer[serverName] = {
+          state.mcpToolsPerServer[serverName] = {
             status: 'unavailable',
             error: 'could not retrieve tools from server',
             client,
@@ -320,10 +357,10 @@ export class MCPService {
           };
         }
 
-        logger.debug(`Checking MCP server "${serverName}" availability: end`);
+        logger.debug(`[tenant:${scope}] Checking MCP server "${serverName}" availability: end`);
       } catch (error) {
         logger.error(`Failed to connect to server ${serverName}:`, error);
-        this._mcpToolsPerServer[serverName] = {
+        state.mcpToolsPerServer[serverName] = {
           status: 'unavailable',
           error: 'could not connect to server',
           client,
@@ -334,16 +371,19 @@ export class MCPService {
 
     await Promise.allSettled(checkPromises);
 
-    return this._mcpToolsPerServer;
+    return state.mcpToolsPerServer;
   }
 
-  private async _closeClients(): Promise<void> {
-    const closePromises = Object.entries(this._mcpToolsPerServer).map(async ([serverName, server]) => {
+  private async _closeClients(tenantId?: string): Promise<void> {
+    const scope = this._normalizeTenantId(tenantId);
+    const state = this._getTenantState(scope);
+
+    const closePromises = Object.entries(state.mcpToolsPerServer).map(async ([serverName, server]) => {
       if (!server.client) {
         return;
       }
 
-      logger.debug(`Closing client for server "${serverName}"`);
+      logger.debug(`[tenant:${scope}] Closing client for server "${serverName}"`);
 
       try {
         await server.client.close();
@@ -353,22 +393,24 @@ export class MCPService {
     });
 
     await Promise.allSettled(closePromises);
-    this._tools = {};
-    this._toolsWithoutExecute = {};
-    this._mcpToolsPerServer = {};
-    this._toolNamesToServerNames.clear();
+    state.tools = {};
+    state.toolsWithoutExecute = {};
+    state.mcpToolsPerServer = {};
+    state.toolNamesToServerNames.clear();
   }
 
-  isValidToolName(toolName: string): boolean {
-    return toolName in this._tools;
+  isValidToolName(toolName: string, tenantId?: string): boolean {
+    const state = this._getTenantState(tenantId);
+    return toolName in state.tools;
   }
 
-  processToolCall(toolCall: ToolCall, dataStream: DataStreamWriter): void {
+  processToolCall(toolCall: ToolCall, dataStream: DataStreamWriter, tenantId?: string): void {
+    const state = this._getTenantState(tenantId);
     const { toolCallId, toolName } = toolCall;
 
-    if (this.isValidToolName(toolName)) {
-      const { description = 'No description available' } = this.toolsWithoutExecute[toolName];
-      const serverName = this._toolNamesToServerNames.get(toolName);
+    if (this.isValidToolName(toolName, tenantId)) {
+      const { description = 'No description available' } = state.toolsWithoutExecute[toolName];
+      const serverName = state.toolNamesToServerNames.get(toolName);
 
       if (serverName) {
         dataStream.writeMessageAnnotation({
@@ -386,7 +428,9 @@ export class MCPService {
     messages: Message[],
     dataStream: DataStreamWriter,
     budget?: ToolExecutionBudget,
+    tenantId?: string,
   ): Promise<Message[]> {
+    const state = this._getTenantState(tenantId);
     const lastMessage = messages[messages.length - 1];
     const parts = lastMessage.parts;
 
@@ -405,7 +449,7 @@ export class MCPService {
         const { toolName, toolCallId } = toolInvocation;
 
         // return part as-is if tool does not exist, or if it's not a tool call result
-        if (!this.isValidToolName(toolName) || toolInvocation.state !== 'result') {
+        if (!this.isValidToolName(toolName, tenantId) || toolInvocation.state !== 'result') {
           return part;
         }
 
@@ -438,7 +482,7 @@ export class MCPService {
         }
 
         if (toolInvocation.result === TOOL_EXECUTION_APPROVAL.APPROVE) {
-          const toolInstance = this._tools[toolName];
+          const toolInstance = state.tools[toolName];
 
           if (toolInstance && typeof toolInstance.execute === 'function') {
             logger.debug(`calling tool "${toolName}" with args: ${JSON.stringify(toolInvocation.args)}`);
@@ -451,7 +495,7 @@ export class MCPService {
               if (budget) {
                 budget.callsUsed += 1;
               }
-              const serverName = this._toolNamesToServerNames.get(toolName);
+              const serverName = state.toolNamesToServerNames.get(toolName);
               if (budget) {
                 logger.info(
                   `[run:${budget.runId || 'unknown'}] [tenant:${budget.tenantId || 'public'}] MCP tool executed`,
@@ -466,7 +510,7 @@ export class MCPService {
               result = transformMcpToolResult(
                 {
                   toolName,
-                  description: this.toolsWithoutExecute[toolName]?.description,
+                  description: state.toolsWithoutExecute[toolName]?.description,
                   serverName,
                 } satisfies McpToolMeta,
                 rawResult,
@@ -509,26 +553,32 @@ export class MCPService {
   }
 
   get tools() {
-    return this._tools;
+    return this._getTenantState('public').tools;
   }
 
   get toolsWithoutExecute() {
-    return this._toolsWithoutExecute;
+    return this._getTenantState('public').toolsWithoutExecute;
   }
 
-  getToolCatalog(): McpToolMeta[] {
-    return Object.entries(this._toolsWithoutExecute).map(([toolName, tool]) => ({
+  getToolsWithoutExecute(tenantId?: string): ToolSet {
+    return this._getTenantState(tenantId).toolsWithoutExecute;
+  }
+
+  getToolCatalog(tenantId?: string): McpToolMeta[] {
+    const state = this._getTenantState(tenantId);
+    return Object.entries(state.toolsWithoutExecute).map(([toolName, tool]) => ({
       toolName,
       description: tool.description || 'No description available',
-      serverName: this._toolNamesToServerNames.get(toolName),
+      serverName: state.toolNamesToServerNames.get(toolName),
     }));
   }
 
-  getToolsWithoutExecuteByNames(toolNames: string[]): ToolSet {
+  getToolsWithoutExecuteByNames(toolNames: string[], tenantId?: string): ToolSet {
+    const state = this._getTenantState(tenantId);
     const selected = new Set(toolNames);
     const scoped: ToolSet = {};
 
-    for (const [toolName, tool] of Object.entries(this._toolsWithoutExecute)) {
+    for (const [toolName, tool] of Object.entries(state.toolsWithoutExecute)) {
       if (selected.has(toolName)) {
         scoped[toolName] = tool;
       }
@@ -537,12 +587,19 @@ export class MCPService {
     return scoped;
   }
 
-  async executeTool(toolName: string, args: Record<string, unknown>, messages: Message[] = []): Promise<unknown> {
-    if (!this.isValidToolName(toolName)) {
+  async executeTool(
+    toolName: string,
+    args: Record<string, unknown>,
+    messages: Message[] = [],
+    tenantId?: string,
+  ): Promise<unknown> {
+    const state = this._getTenantState(tenantId);
+
+    if (!this.isValidToolName(toolName, tenantId)) {
       throw new Error(`Tool "${toolName}" is not registered`);
     }
 
-    const toolInstance = this._tools[toolName];
+    const toolInstance = state.tools[toolName];
 
     if (!toolInstance || typeof toolInstance.execute !== 'function') {
       throw new Error(`Tool "${toolName}" has no execute function`);
@@ -556,8 +613,8 @@ export class MCPService {
     return transformMcpToolResult(
       {
         toolName,
-        description: this.toolsWithoutExecute[toolName]?.description,
-        serverName: this._toolNamesToServerNames.get(toolName),
+        description: state.toolsWithoutExecute[toolName]?.description,
+        serverName: state.toolNamesToServerNames.get(toolName),
       } satisfies McpToolMeta,
       raw,
     );
