@@ -40,6 +40,95 @@ function parseCookies(cookieHeader: string): Record<string, string> {
   return cookies;
 }
 
+type TenantPlan = 'free' | 'pro' | 'enterprise';
+
+type EffectiveLimits = {
+  tenantId: string;
+  plan: TenantPlan;
+  maxLLMSteps: number;
+  maxToolsPerRole: number;
+  maxMcpCallsPerTurn: number;
+  maxBackgroundResearchCalls: number;
+  backgroundResearchEnabled: boolean;
+};
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function envLimit(env: Record<string, unknown> | undefined, key: string, fallback: number): number {
+  return clampInt(env?.[key], fallback, 1, 1000);
+}
+
+function resolveTenantPlan(raw: unknown): TenantPlan {
+  const value = String(raw || '').toLowerCase();
+
+  if (value === 'enterprise') {
+    return 'enterprise';
+  }
+
+  if (value === 'pro') {
+    return 'pro';
+  }
+
+  return 'free';
+}
+
+function resolveEffectiveLimits(args: {
+  request: Request;
+  cookies: Record<string, string>;
+  env?: Record<string, unknown>;
+  requestMaxLLMSteps: number;
+  requestMaxToolsPerRole?: number;
+  requestMaxMcpCallsPerTurn?: number;
+  alwaysOnBackgroundWebResearch?: boolean;
+}): EffectiveLimits {
+  const { request, cookies, env } = args;
+  const tenantId = String(
+    request.headers.get('x-tenant-id') || cookies.tenantId || cookies.userId || cookies.sessionId || 'public',
+  );
+  const plan = resolveTenantPlan(request.headers.get('x-plan-tier') || cookies.planTier || env?.DEFAULT_TENANT_PLAN);
+
+  const baseByPlan: Record<TenantPlan, { llm: number; tools: number; calls: number; research: number }> = {
+    free: { llm: 6, tools: 4, calls: 10, research: 3 },
+    pro: { llm: 10, tools: 6, calls: 16, research: 5 },
+    enterprise: { llm: 14, tools: 10, calls: 28, research: 8 },
+  };
+  const base = baseByPlan[plan];
+
+  const maxLLMStepsCap = envLimit(env, 'ASTRO_MAX_LLM_STEPS', base.llm);
+  const maxToolsCap = envLimit(env, 'ASTRO_MAX_TOOLS_PER_ROLE', base.tools);
+  const maxMcpCallsCap = envLimit(env, 'ASTRO_MAX_MCP_CALLS_PER_TURN', base.calls);
+  const maxResearchCallsCap = envLimit(env, 'ASTRO_MAX_BACKGROUND_RESEARCH_CALLS', base.research);
+
+  const effectiveMaxLLMSteps = clampInt(args.requestMaxLLMSteps, Math.min(6, maxLLMStepsCap), 1, maxLLMStepsCap);
+  const effectiveMaxToolsPerRole = clampInt(args.requestMaxToolsPerRole, Math.min(6, maxToolsCap), 1, maxToolsCap);
+  const effectiveMaxMcpCallsPerTurn = clampInt(
+    args.requestMaxMcpCallsPerTurn,
+    Math.min(12, maxMcpCallsCap),
+    1,
+    maxMcpCallsCap,
+  );
+  const backgroundResearchEnabledByEnv = String(env?.ASTRO_BACKGROUND_RESEARCH_ENABLED ?? 'true') !== 'false';
+  const backgroundResearchEnabled = backgroundResearchEnabledByEnv && args.alwaysOnBackgroundWebResearch !== false;
+
+  return {
+    tenantId,
+    plan,
+    maxLLMSteps: effectiveMaxLLMSteps,
+    maxToolsPerRole: effectiveMaxToolsPerRole,
+    maxMcpCallsPerTurn: effectiveMaxMcpCallsPerTurn,
+    maxBackgroundResearchCalls: Math.max(1, Math.min(maxResearchCallsCap, effectiveMaxMcpCallsPerTurn)),
+    backgroundResearchEnabled,
+  };
+}
+
 function getLastUserMessageText(messages: any[]): string {
   const lastUser = [...messages].reverse().find((message) => message.role === 'user');
 
@@ -108,8 +197,10 @@ async function runBackgroundWebResearch(args: {
   mcpService: MCPService;
   messages: any[];
   maxCalls: number;
+  runId: string;
+  tenantId: string;
 }): Promise<string | undefined> {
-  const { mcpService, messages, maxCalls } = args;
+  const { mcpService, messages, maxCalls, runId, tenantId } = args;
   const callBudget = Math.max(1, Math.min(8, maxCalls));
   let callsUsed = 0;
   const catalog = mcpService.getToolCatalog();
@@ -148,6 +239,12 @@ async function runBackgroundWebResearch(args: {
           messages,
         );
         callsUsed += 1;
+        logger.info(`[run:${runId}] [tenant:${tenantId}] MCP tool executed`, {
+          tool: navigateTool.toolName,
+          targetUrl,
+          callsUsed,
+          callBudget,
+        });
         results.push(`Navigate(${targetUrl}) via ${navigateTool.toolName}: ${JSON.stringify(navigateResult).slice(0, 2200)}`);
       }
     }
@@ -155,6 +252,11 @@ async function runBackgroundWebResearch(args: {
     if (snapshotTool && callsUsed < callBudget) {
       const snapshotResult = await mcpService.executeTool(snapshotTool.toolName, {}, messages);
       callsUsed += 1;
+      logger.info(`[run:${runId}] [tenant:${tenantId}] MCP tool executed`, {
+        tool: snapshotTool.toolName,
+        callsUsed,
+        callBudget,
+      });
       results.push(`Snapshot(${snapshotTool.toolName}): ${JSON.stringify(snapshotResult).slice(0, 3600)}`);
     }
   } catch (error) {
@@ -212,12 +314,47 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
       };
       maxLLMSteps: number;
     }>();
-
+  const runId = generateId();
   const cookieHeader = request.headers.get('Cookie');
-  const apiKeys = JSON.parse(parseCookies(cookieHeader || '').apiKeys || '{}');
+  const cookies = parseCookies(cookieHeader || '');
+  const envRecord = context.cloudflare?.env as unknown as Record<string, unknown> | undefined;
+  const limits = resolveEffectiveLimits({
+    request,
+    cookies,
+    env: envRecord,
+    requestMaxLLMSteps: maxLLMSteps,
+    requestMaxToolsPerRole: maxToolsPerRole,
+    requestMaxMcpCallsPerTurn: maxMcpCallsPerTurn,
+    alwaysOnBackgroundWebResearch,
+  });
+
+  if (messages.length > envLimit(envRecord, 'ASTRO_MAX_MESSAGES', 120)) {
+    return new Response(
+      JSON.stringify({
+        error: true,
+        message: 'Conversation has too many messages for one run. Start a new thread or trim history.',
+        statusCode: 413,
+        isRetryable: false,
+      }),
+      { status: 413, headers: { 'Content-Type': 'application/json' } },
+    );
+  }
+
+  const apiKeys = JSON.parse(cookies.apiKeys || '{}');
   const providerSettings: Record<string, IProviderSetting> = JSON.parse(
-    parseCookies(cookieHeader || '').providers || '{}',
+    cookies.providers || '{}',
   );
+
+  logger.info(`[run:${runId}] chat start`, {
+    tenantId: limits.tenantId,
+    plan: limits.plan,
+    messageCount: messages.length,
+    chatMode,
+    maxLLMSteps: limits.maxLLMSteps,
+    maxToolsPerRole: limits.maxToolsPerRole,
+    maxMcpCallsPerTurn: limits.maxMcpCallsPerTurn,
+    backgroundResearchEnabled: limits.backgroundResearchEnabled,
+  });
 
   const stream = new SwitchableStream();
 
@@ -247,8 +384,10 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         let scopedTools = mcpService.toolsWithoutExecute;
 
         const toolBudget = {
-          maxCallsPerTurn: Math.max(1, Math.min(40, maxMcpCallsPerTurn || 12)),
+          maxCallsPerTurn: limits.maxMcpCallsPerTurn,
           callsUsed: 0,
+          tenantId: limits.tenantId,
+          runId,
         };
 
         let processedMessages = await mcpService.processToolInvocations(messages, dataStream, toolBudget);
@@ -359,12 +498,17 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           // logger.debug('Code Files Selected');
         }
 
-        const shouldRunBackgroundResearch = alwaysOnBackgroundWebResearch !== false;
+        const shouldRunBackgroundResearch = limits.backgroundResearchEnabled;
         if (shouldRunBackgroundResearch) {
           const researchContext = await runBackgroundWebResearch({
             mcpService,
             messages: processedMessages,
-            maxCalls: Math.max(1, Math.min(6, toolBudget.maxCallsPerTurn - toolBudget.callsUsed)),
+            maxCalls: Math.max(
+              1,
+              Math.min(limits.maxBackgroundResearchCalls, toolBudget.maxCallsPerTurn - toolBudget.callsUsed),
+            ),
+            runId,
+            tenantId: limits.tenantId,
           });
 
           if (researchContext) {
@@ -394,7 +538,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
               contextFiles: filteredFiles,
               mcpTools: mcpService.getToolCatalog(),
               publicDesignMode,
-              maxToolsPerRole,
+              maxToolsPerRole: limits.maxToolsPerRole,
               apiKeys,
               providerSettings,
               env: context.cloudflare?.env,
@@ -433,7 +577,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           supabaseConnection: supabase,
           toolChoice: 'auto',
           tools: scopedTools,
-          maxSteps: maxLLMSteps,
+          maxSteps: limits.maxLLMSteps,
           onStepFinish: ({ toolCalls }) => {
             // add tool call annotations for frontend processing
             toolCalls.forEach((toolCall) => {
@@ -468,6 +612,11 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
               await new Promise((resolve) => setTimeout(resolve, 0));
 
               // stream.close();
+              logger.info(`[run:${runId}] chat complete`, {
+                tenantId: limits.tenantId,
+                toolCallsUsed: toolBudget.callsUsed,
+                usage: cumulativeUsage,
+              });
               return;
             }
 
@@ -651,6 +800,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
     });
   } catch (error: any) {
     logger.error(error);
+    logger.error(`[run:${runId}] chat failed`, { tenantId: limits.tenantId, error: String(error) });
 
     const errorResponse = {
       error: true,

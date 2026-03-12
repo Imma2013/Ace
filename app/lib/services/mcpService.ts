@@ -89,6 +89,8 @@ export type ToolCall = {
 export type ToolExecutionBudget = {
   maxCallsPerTurn: number;
   callsUsed: number;
+  tenantId?: string;
+  runId?: string;
 };
 
 export type MCPServerTools = Record<string, MCPServer>;
@@ -410,6 +412,14 @@ export class MCPService {
         let result;
 
         if (budget && budget.callsUsed >= budget.maxCallsPerTurn) {
+          logger.warn(
+            `[run:${budget.runId || 'unknown'}] [tenant:${budget.tenantId || 'public'}] MCP budget exceeded`,
+            {
+              toolName,
+              callsUsed: budget.callsUsed,
+              maxCallsPerTurn: budget.maxCallsPerTurn,
+            },
+          );
           result = `[HUMAN_REVIEW_REQUIRED] MCP call budget exceeded (${budget.maxCallsPerTurn} per turn).`;
           dataStream.write(
             formatDataStreamPart('tool_result', {
@@ -442,6 +452,17 @@ export class MCPService {
                 budget.callsUsed += 1;
               }
               const serverName = this._toolNamesToServerNames.get(toolName);
+              if (budget) {
+                logger.info(
+                  `[run:${budget.runId || 'unknown'}] [tenant:${budget.tenantId || 'public'}] MCP tool executed`,
+                  {
+                    toolName,
+                    serverName,
+                    callsUsed: budget.callsUsed,
+                    maxCallsPerTurn: budget.maxCallsPerTurn,
+                  },
+                );
+              }
               result = transformMcpToolResult(
                 {
                   toolName,

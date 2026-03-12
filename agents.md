@@ -17,3 +17,8 @@
 - Router scopes tools by role and request; only selected MCP tool names are passed to the active LLM turn.
 - Playwright MCP research path is constrained to approved domains for frontend inspiration/docs.
 - Electron removed in ACE; cloud/web deployment path remains primary.
+
+## Update 2026-03-12
+- Added runtime governance layer in `api.chat` with tenant + plan limit enforcement and run-id based logging.
+- MCP service now logs per-tool execution and budget-overrun with run/tenant metadata.
+- Remaining hardening target: tenant-isolated MCP server config map (currently shared singleton config).

@@ -46,3 +46,9 @@
 - Set `origin` to `https://github.com/Imma2013/Ace.git`.
 - Commit and push `main`.
 - Optionally prune all non-main remote branches.
+
+## Update 2026-03-12
+- Terminal: T1 codex
+- Task: Added phase-1 production guardrails in chat runtime: tenant/plan-aware clamps for max LLM steps, MCP calls, and tools-per-role; enforced message-count ceiling; added run-scoped MCP execution and budget-exceeded audit logs.
+- Validation: `npm run typecheck` passed; `npm run build` had previously passed on this branch after migration.
+- Next: wire tenant-scoped MCP config persistence and expose run audit entries in UI/admin panel.
